@@ -32,6 +32,10 @@ import (
 	"strings"
 )
 
+// Used for padding NOP instruction
+const OP_NOP = 0x00000013
+const OP_CNOP = 0x0001
+
 func buildop(ctxt *obj.Link) {}
 
 func jalToSym(ctxt *obj.Link, p *obj.Prog, lr int16) {
@@ -545,6 +549,55 @@ func preprocess(ctxt *obj.Link, cursym *obj.LSym, newprog obj.ProgAlloc) {
 	// Additional instruction rewriting.
 	for p := cursym.Func().Text; p != nil; p = p.Link {
 		switch p.As {
+		case ALRW, ALRD:
+			/* Add sequence:
+			sync.i
+			j .Llr_aqrl.
+			.align 7
+			.Llr_aqrl:
+			dcache.cval1 xy
+			lr.*.aqryl (xy)
+			sync
+			.aligin 7
+			next insn
+			*/
+			dest := p.To
+			src := p.From
+			pas := p.As
+
+			p.As = ATHSYNCI
+			p.From = obj.Addr{}
+			p.To = obj.Addr{}
+
+			jmp := obj.Appendp(p, newprog)
+			jmp.As = AJAL
+			jmp.From.Reg = REG_ZERO
+			jmp.To = obj.Addr{Type: obj.TYPE_BRANCH}
+
+			p = obj.Appendp(jmp, newprog)
+			p.As = obj.APCALIGN
+			p.From.Type = obj.TYPE_CONST
+			p.From.Offset = 128
+
+			p = obj.Appendp(p, newprog)
+			jmp.To.SetTarget(p)
+			p.As = ATHDCACHECVAL1
+			p.From.Reg = src.Reg
+			p.From.Type = obj.TYPE_MEM
+
+			p = obj.Appendp(p, newprog)
+			p.As = pas
+			p.From = src
+			p.To = dest
+
+			p = obj.Appendp(p, newprog)
+			p.As = ATHSYNC
+
+			p = obj.Appendp(p, newprog)
+			p.As = obj.APCALIGN
+			p.From.Type = obj.TYPE_CONST
+			p.From.Offset = 128
+
 		case obj.AGETCALLERPC:
 			if cursym.Leaf() {
 				// MOV LR, Rd
@@ -777,6 +830,7 @@ func preprocess(ctxt *obj.Link, cursym *obj.LSym, newprog obj.ProgAlloc) {
 	}
 }
 
+// align code to a certain length by padding bytes.
 func pcAlignPadLength(pc int64, alignedValue int64) int {
 	return int(-pc & (alignedValue - 1))
 }
@@ -1495,6 +1549,49 @@ func EncodeUImmediate(imm int64) (int64, error) {
 	return imm << 12, nil
 }
 
+// THead Extension ISA
+// 3. XTheadCmo provides instructions for cache management.
+// 4. XTheadSync provides instructions for multi-processor synchronization.
+func encodeXTheadCMO(ins *instruction) uint32 {
+	enc := encode(ins.as)
+	if enc == nil {
+		panic("encodeXTheadCMO: could not encode instruction")
+	}
+	return enc.funct7<<25 | enc.rs2<<20 | enc.funct3<<12 | enc.opcode
+}
+
+func validateXTheadCMO(ctxt *obj.Link, ins *instruction) {
+	// Nothing here.
+}
+
+func encodeXTheadCMOReg(ins *instruction) uint32 {
+	enc := encode(ins.as)
+	if enc == nil {
+		panic("encodeXTheadCMOReg: could not encode instruction")
+	}
+	rs1 := regI(ins.rs1)
+	return enc.funct7<<25 | enc.rs2<<20 | rs1<<15 | enc.funct3<<12 | enc.opcode
+}
+
+func validateXTheadCMOReg(ctxt *obj.Link, ins *instruction) {
+	wantIntReg(ctxt, ins, "rs1", ins.rs1)
+}
+
+func encodeXTheadCMORegReg(ins *instruction) uint32 {
+	enc := encode(ins.as)
+	if enc == nil {
+		panic("encodeXTheadCMORegReg: could not encode instruction")
+	}
+	rs1 := regI(ins.rs1)
+	rs2 := regI(ins.rs2)
+	return enc.funct7<<25 | rs2<<20 | rs1<<15 | enc.funct3<<12 | enc.opcode
+}
+
+func validateXTheadCMORegReg(ctxt *obj.Link, ins *instruction) {
+	wantIntReg(ctxt, ins, "rs1", ins.rs1)
+	wantIntReg(ctxt, ins, "rs2", ins.rs2)
+}
+
 type encoding struct {
 	encode   func(*instruction) uint32     // encode returns the machine code for an instruction
 	validate func(*obj.Link, *instruction) // validate validates an instruction
@@ -1541,6 +1638,13 @@ var (
 	// badEncoding is used when an invalid op is encountered.
 	// An error has already been generated, so let anything else through.
 	badEncoding = encoding{encode: func(*instruction) uint32 { return 0 }, validate: func(*obj.Link, *instruction) {}, length: 0}
+
+	// THead Extension ISA
+	// 3. XTheadCmo provides instructions for cache management.
+	// 4. XTheadSync provides instructions for multi-processor synchronization.
+	xTheadCMOEncoding       = encoding{encode: encodeXTheadCMO, validate: validateXTheadCMO, length: 4}
+	xTheadCMORegEncoding    = encoding{encode: encodeXTheadCMOReg, validate: validateXTheadCMOReg, length: 4}
+	xTheadCMORegRegEncoding = encoding{encode: encodeXTheadCMORegReg, validate: validateXTheadCMORegReg, length: 4}
 )
 
 // encodings contains the encodings for RISC-V instructions.
@@ -1798,6 +1902,37 @@ var encodings = [ALAST & obj.AMask]encoding{
 	ABINVI & obj.AMask: iIEncoding,
 	ABSET & obj.AMask:  rIIIEncoding,
 	ABSETI & obj.AMask: iIEncoding,
+
+	// THead Extension ISA
+	// 3. XTheadCmo provides instructions for cache management.
+	ATHDCACHECALL & obj.AMask:   xTheadCMOEncoding,
+	ATHDCACHECIALL & obj.AMask:  xTheadCMOEncoding,
+	ATHDCACHEIALL & obj.AMask:   xTheadCMOEncoding,
+	ATHDCACHECPA & obj.AMask:    xTheadCMORegEncoding,
+	ATHDCACHECIPA & obj.AMask:   xTheadCMORegEncoding,
+	ATHDCACHEIPA & obj.AMask:    xTheadCMORegEncoding,
+	ATHDCACHECVA & obj.AMask:    xTheadCMORegEncoding,
+	ATHDCACHECIVA & obj.AMask:   xTheadCMORegEncoding,
+	ATHDCACHEIVA & obj.AMask:    xTheadCMORegEncoding,
+	ATHDCACHECSW & obj.AMask:    xTheadCMORegEncoding,
+	ATHDCACHECISW & obj.AMask:   xTheadCMORegEncoding,
+	ATHDCACHEISW & obj.AMask:    xTheadCMORegEncoding,
+	ATHDCACHECPAL1 & obj.AMask:  xTheadCMORegEncoding,
+	ATHDCACHECVAL1 & obj.AMask:  xTheadCMORegEncoding,
+	ATHICACHEIALL & obj.AMask:   xTheadCMOEncoding,
+	ATHICACHEIALLS & obj.AMask:  xTheadCMOEncoding,
+	ATHICACHEIPA & obj.AMask:    xTheadCMORegEncoding,
+	ATHICACHEIVA & obj.AMask:    xTheadCMORegEncoding,
+	ATHL2CACHECALL & obj.AMask:  xTheadCMOEncoding,
+	ATHL2CACHECIALL & obj.AMask: xTheadCMOEncoding,
+	ATHL2CACHEIALL & obj.AMask:  xTheadCMOEncoding,
+
+	// 4. XTheadSync provides instructions for multi-processor synchronization.
+	ATHSFENCEVMAS & obj.AMask: xTheadCMORegRegEncoding,
+	ATHSYNC & obj.AMask:       xTheadCMOEncoding,
+	ATHSYNCS & obj.AMask:      xTheadCMOEncoding,
+	ATHSYNCI & obj.AMask:      xTheadCMOEncoding,
+	ATHSYNCIS & obj.AMask:     xTheadCMOEncoding,
 
 	// Escape hatch
 	AWORD & obj.AMask: rawEncoding,
@@ -2335,10 +2470,48 @@ func instructionsForRotate(p *obj.Prog, ins *instruction) []*instruction {
 	}
 }
 
+func instructionForXThead(p *obj.Prog, ins *instruction, inss []*instruction) ([]*instruction, bool) {
+	switch ins.as {
+	// THead Extension ISA
+	// 3. XTheadCmo provides instructions for cache management.
+	// 4. XTheadSync provides instructions for multi-processor synchronization.
+	// Example: ATHDCACHECALL
+	case ATHDCACHECALL, ATHDCACHECIALL, ATHDCACHEIALL, ATHICACHEIALL, ATHICACHEIALLS,
+		ATHL2CACHECALL, ATHL2CACHECIALL, ATHL2CACHEIALL, ATHSYNC, ATHSYNCS, ATHSYNCI, ATHSYNCIS:
+		// No special handling.
+
+	// 3. XTheadCmo provides instructions for cache management.
+	// 4. XTheadSync provides instructions for multi-processor synchronization.
+	// Example: ATHDCACHECPA rs1
+	case ATHDCACHECPA, ATHDCACHECIPA, ATHDCACHEIPA,
+		ATHDCACHECVA, ATHDCACHECIVA, ATHDCACHEIVA, ATHDCACHECSW, ATHDCACHECISW, ATHDCACHEISW,
+		ATHDCACHECPAL1, ATHDCACHECVAL1, ATHICACHEIPA, ATHICACHEIVA:
+		ins.rs1 = uint32(p.From.Reg)
+
+	// 4. XTheadSync provides instructions for multi-processor synchronization.
+	// Example: ATHSFENCEVMAS rs1, rs2
+	case ATHSFENCEVMAS:
+		ins.rs1 = uint32(p.From.Reg)
+		ins.rs2 = uint32(p.To.Reg)
+	default:
+		return nil, true
+	}
+
+	return inss, true
+}
+
 // instructionsForProg returns the machine instructions for an *obj.Prog.
 func instructionsForProg(p *obj.Prog) []*instruction {
 	ins := instructionForProg(p)
 	inss := []*instruction{ins}
+
+	xthead, success := instructionForXThead(p, ins, inss)
+	if !success {
+		return nil
+	}
+	if xthead != nil {
+		return xthead
+	}
 
 	if len(p.RestArgs) > 1 {
 		p.Ctxt.Diag("too many source registers")
@@ -2386,7 +2559,7 @@ func instructionsForProg(p *obj.Prog) []*instruction {
 
 	case ALRW, ALRD:
 		// Set aq to use acquire access ordering
-		ins.funct7 = 2
+		ins.funct7 = 3
 		ins.rs1, ins.rs2 = uint32(p.From.Reg), REG_ZERO
 
 	case AADDI, AANDI, AORI, AXORI:
@@ -2623,6 +2796,9 @@ func assemble(ctxt *obj.Link, cursym *obj.LSym, newprog obj.ProgAlloc) {
 				// NOP
 				cursym.WriteBytes(ctxt, offset, []byte{0x13, 0, 0, 0})
 				offset += 4
+			}
+			if v > 0 {
+				cursym.WriteInt(ctxt, offset, 2, int64(OP_CNOP))
 			}
 			continue
 		}
