@@ -285,7 +285,7 @@ func TestPCAlign(t *testing.T) {
 	tmpfile := filepath.Join(dir, "x.s")
 	asm := `
 TEXT _stub(SB),$0-0
-	FENCE
+	CNOP
 	PCALIGN	$8
 	FENCE
 	RET
@@ -300,12 +300,34 @@ TEXT _stub(SB),$0-0
 		t.Errorf("Failed to assemble: %v\n%s", err, out)
 	}
 	// The expected instruction sequence after alignment:
-	//	FENCE
+	//	CNOP
 	//	NOP
+	//	CNOP
 	//	FENCE
 	//	RET
-	want := "0f 00 f0 0f 13 00 00 00 0f 00 f0 0f 67 80 00 00"
+	want := "01 00 13 00 00 00 01 00 0f 00 f0 0f 67 80 00 00"
 	if !strings.Contains(string(out), want) {
 		t.Errorf("PCALIGN test failed - got %s\nwant %s", out, want)
+	}
+
+	// generate a test with invalid use of PCALIGN
+	tmpfile = filepath.Join(dir, "xi.s")
+	invalidAsm := `
+TEXT _stub(SB),$0-0
+	CNOP
+	PCALIGN	$3
+	RET
+`
+	err = os.WriteFile(tmpfile, []byte(invalidAsm), 0644)
+	if err != nil {
+		t.Fatalf("can't write output: %v\n", err)
+	}
+
+	// build test with errors and check for messages
+	cmd = exec.Command(testenv.GoToolPath(t), "tool", "asm", "-o", filepath.Join(dir, "xi.o"), "-S", tmpfile)
+	cmd.Env = append(os.Environ(), "GOARCH=riscv64", "GOOS=linux")
+	out, err = cmd.CombinedOutput()
+	if !strings.Contains(string(out), "alignment value of an instruction must be a power of two and in the range [4, 2048], got 3") {
+		t.Errorf("Invalid alignment not detected for PCALIGN\n")
 	}
 }
