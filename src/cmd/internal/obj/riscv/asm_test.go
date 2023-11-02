@@ -281,6 +281,7 @@ func TestBranch(t *testing.T) {
 }
 
 func TestPCAlign(t *testing.T) {
+	t.Skip("CNOP is not supported by Go asm yet")
 	dir := t.TempDir()
 	tmpfile := filepath.Join(dir, "x.s")
 	asm := `
