@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"internal/testenv"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
